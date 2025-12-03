@@ -2,11 +2,16 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
+
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/transform"
 )
 
 // Config 配置需要忽略的目录和文件后缀
@@ -16,6 +21,7 @@ type Config struct {
 	IgnoredExts  map[string]bool
 	IgnoredFiles map[string]bool // 指定要完全隐藏的文件 (既不在树中显示，也不读取内容)
 	MaxFileSize  int64           // 忽略过大的文件
+	TextExts     map[string]bool // 强制视为文本的文件后缀
 }
 
 // 初始化默认配置
@@ -54,6 +60,14 @@ var config = Config{
 		"dir2txt.go":  true,
 		"dir2txt":     true,
 		"dir2txt.exe": true,
+	},
+	TextExts: map[string]bool{
+		".md": true, ".txt": true, ".log": true,
+		".go": true, ".java": true, ".py": true, ".js": true, ".ts": true,
+		".c": true, ".cpp": true, ".h": true, ".hpp": true,
+		".html": true, ".css": true, ".xml": true, ".yaml": true, ".yml": true,
+		".json": true, ".sql": true, ".properties": true, ".ini": true,
+		".sh": true, ".bat": true, ".conf": true, ".toml": true,
 	},
 	MaxFileSize: 1024 * 1024, // 1MB
 }
@@ -119,11 +133,6 @@ func main() {
 			return nil
 		}
 
-		// 关键修复：如果是根目录本身（"."），不要被视为隐藏文件跳过
-		if path == root || name == "." {
-			return nil
-		}
-
 		// 检查是否是"垃圾"目录或文件 (完全忽略，既不出现在树里也不处理内容)
 		if isJunk(name) {
 			if d.IsDir() {
@@ -156,47 +165,62 @@ func main() {
 
 // processFile 读取文件并格式化写入 Markdown
 func processFile(path string, writer *bufio.Writer) error {
-	// 获取文件信息
+	// 1. 获取文件信息与大小检查
 	info, err := os.Stat(path)
 	if err != nil {
-		return nil // 忽略无法读取的文件
+		return nil
 	}
-
-	// 检查文件大小
 	if info.Size() > config.MaxFileSize {
-		fmt.Printf("跳过大文件 (>1MB): %s\n", path)
+		fmt.Printf("[SKIP] 大文件 (>1MB): %s\n", path)
 		return nil
 	}
 
-	// 读取文件内容
+	// 2. 读取文件内容
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return nil
 	}
 
-	// 检查是否为二进制文件
-	if isBinary(content) {
+	ext := strings.ToLower(filepath.Ext(path))
+	isForceText := config.TextExts[ext]
+
+	// 3. 二进制检查（非白名单才检查）
+	if !isForceText && isBinary(content) {
+		fmt.Printf("[SKIP] 检测到二进制文件: %s\n", path)
 		return nil
 	}
 
-	// 获取扩展名用于 Markdown 代码块标记
-	ext := strings.TrimPrefix(filepath.Ext(path), ".")
-	if ext == "" {
-		ext = "text"
+	// 4. 编码检测与转换
+	utf8Content, encoding, err := convertToUTF8(content)
+	if err != nil {
+		fmt.Printf("[WARN] 无法识别文件编码 (已跳过): %s\n", path)
+		fmt.Printf("       -> 原因: 内容非 UTF-8 且非 GBK，或包含非法字符。\n")
+		return nil
 	}
 
-	// 写入 Markdown 格式
+	// 5. 如果发生了转码，发出通知
+	if encoding != "UTF-8" {
+		fmt.Printf("[INFO] 自动转换编码 [%s -> UTF-8]: %s\n", encoding, path)
+	}
+
+	// 6. 写入 Markdown
 	fmt.Printf("正在处理: %s\n", path)
 
 	// 标准化路径分隔符
 	displayPath := filepath.ToSlash(path)
 
+	// 确定代码块语言标记
+	codeBlockLang := strings.TrimPrefix(ext, ".")
+	if codeBlockLang == "" {
+		codeBlockLang = "text"
+	}
+
 	writer.WriteString(fmt.Sprintf("## File: %s\n\n", displayPath))
-	writer.WriteString(fmt.Sprintf("```%s\n", ext))
-	writer.Write(content)
+	writer.WriteString(fmt.Sprintf("```%s\n", codeBlockLang))
+	writer.Write(utf8Content)
 
 	// 确保代码块如果没换行符结尾，手动补一个
-	if len(content) > 0 && content[len(content)-1] != '\n' {
+	if len(utf8Content) > 0 && utf8Content[len(utf8Content)-1] != '\n' {
 		writer.WriteString("\n")
 	}
 
@@ -255,17 +279,33 @@ func isBinary(content []byte) bool {
 		checkLen = len(content)
 	}
 
-	for i := 0; i < checkLen; i++ {
-		if content[i] == 0 {
-			return true
-		}
-	}
-
-	if !utf8.Valid(content[:checkLen]) {
+	// 真正的二进制文件通常包含 NUL 字节
+	if bytes.IndexByte(content[:checkLen], 0) != -1 {
 		return true
 	}
 
 	return false
+}
+
+// convertToUTF8 尝试将内容转换为 UTF-8
+// 返回: (转换后的内容, 原始编码名称, error)
+func convertToUTF8(content []byte) ([]byte, string, error) {
+	// 1. 先尝试 UTF-8 校验
+	if utf8.Valid(content) {
+		return content, "UTF-8", nil
+	}
+
+	// 2. 尝试 GBK / GB18030 解码
+	reader := transform.NewReader(bytes.NewReader(content), simplifiedchinese.GBK.NewDecoder())
+	decoded, err := io.ReadAll(reader)
+	if err == nil {
+		if utf8.Valid(decoded) {
+			return decoded, "GBK/GB18030", nil
+		}
+	}
+
+	// 3. 其他编码可在此扩展
+	return nil, "Unknown", fmt.Errorf("encoding not recognized")
 }
 
 // writeTree 生成简单的 ASCII 目录树
