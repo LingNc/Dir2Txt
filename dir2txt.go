@@ -3,9 +3,11 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"flag"
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
@@ -13,6 +15,8 @@ import (
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/transform"
 )
+
+const version = "v1.3"
 
 // Config 配置需要忽略的目录和文件后缀
 type Config struct {
@@ -22,6 +26,159 @@ type Config struct {
 	IgnoredFiles map[string]bool // 指定要完全隐藏的文件 (既不在树中显示，也不读取内容)
 	MaxFileSize  int64           // 忽略过大的文件
 	TextExts     map[string]bool // 强制视为文本的文件后缀
+}
+
+// multiValue 允许通过空格或多次传参传入多个值，例如：
+// --filter "*.png *.jpg" --filter "!keep.txt"
+type multiValue []string
+
+func (m *multiValue) String() string {
+	return strings.Join(*m, ",")
+}
+
+func (m *multiValue) Set(s string) error {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Fields(s)
+	*m = append(*m, parts...)
+	return nil
+}
+
+func parseCommandLine() (multiValue, multiValue, string, bool, error) {
+	var dirs multiValue
+	var filters multiValue
+	var out string
+	var help bool
+	args := os.Args[1:]
+	var leftover []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--" && i+1 < len(args):
+			leftover = append(leftover, args[i+1:]...)
+			i = len(args) // end parsing
+		case arg == "--dir":
+			if i+1 >= len(args) {
+				return dirs, filters, out, help, fmt.Errorf("--dir 需要一个路径")
+			}
+			i++
+			dirs.Set(args[i])
+		case strings.HasPrefix(arg, "--dir="):
+			dirs.Set(strings.TrimPrefix(arg, "--dir="))
+		case arg == "--filter":
+			if i+1 >= len(args) {
+				return dirs, filters, out, help, fmt.Errorf("--filter 需要一个表达式")
+			}
+			i++
+			filters.Set(args[i])
+		case strings.HasPrefix(arg, "--filter="):
+			filters.Set(strings.TrimPrefix(arg, "--filter="))
+		case arg == "--out":
+			if i+1 >= len(args) {
+				return dirs, filters, out, help, fmt.Errorf("--out 需要一个路径")
+			}
+			i++
+			out = args[i]
+		case strings.HasPrefix(arg, "--out="):
+			out = strings.TrimPrefix(arg, "--out=")
+		case arg == "--help" || arg == "-h":
+			help = true
+		default:
+			leftover = append(leftover, arg)
+		}
+	}
+	for _, arg := range leftover {
+		if strings.HasPrefix(arg, "!") || strings.ContainsAny(arg, "*?[]") {
+			filters.Set(arg)
+			continue
+		}
+		dirs.Set(arg)
+	}
+	return dirs, filters, out, help, nil
+}
+
+// determineOutputPath 计算最终的输出文件路径
+func determineOutputPath(dirs []string, userOut string) (string, error) {
+	if len(dirs) == 0 {
+		return "", fmt.Errorf("至少需要一个目录")
+	}
+	var absDirs []string
+	for _, dir := range dirs {
+		abs, err := filepath.Abs(dir)
+		if err != nil {
+			return "", err
+		}
+		absDirs = append(absDirs, filepath.Clean(abs))
+	}
+
+	fileName := buildOutputFileName(absDirs)
+	if userOut == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(cwd, fileName), nil
+	}
+
+	cleanOut := filepath.Clean(userOut)
+	dirHint := strings.HasSuffix(userOut, string(os.PathSeparator)) || strings.HasSuffix(userOut, "/") || strings.HasSuffix(userOut, "\\")
+	if strings.EqualFold(filepath.Ext(cleanOut), ".md") {
+		return cleanOut, nil
+	}
+
+	info, err := os.Stat(cleanOut)
+	if err == nil && info.IsDir() {
+		return filepath.Join(cleanOut, fileName), nil
+	}
+
+	// 如果 userOut 以路径分隔符结尾，也当作目录
+	if dirHint {
+		return filepath.Join(cleanOut, fileName), nil
+	}
+
+	// 默认按目录处理，无视是否存在
+	return filepath.Join(cleanOut, fileName), nil
+}
+
+func buildOutputFileName(absDirs []string) string {
+	if len(absDirs) == 1 {
+		return fmt.Sprintf("%s_context.md", filepath.Base(absDirs[0]))
+	}
+	common := findCommonAncestor(absDirs)
+	base := "merged_project"
+	if common != "" && common != filepath.Dir(common) {
+		base = filepath.Base(common)
+	}
+	if base == "" {
+		base = "merged_project"
+	}
+	return fmt.Sprintf("%s_context.md", base)
+}
+
+func findCommonAncestor(paths []string) string {
+	if len(paths) == 0 {
+		return ""
+	}
+	common := paths[0]
+	for _, p := range paths[1:] {
+		for !hasPathPrefix(p, common) {
+			parent := filepath.Dir(common)
+			if parent == common {
+				return ""
+			}
+			common = parent
+		}
+	}
+	return common
+}
+
+func hasPathPrefix(pathStr, prefix string) bool {
+	rel, err := filepath.Rel(prefix, pathStr)
+	if err != nil {
+		return false
+	}
+	return rel == "." || !strings.HasPrefix(rel, "..")
 }
 
 // 初始化默认配置
@@ -73,94 +230,151 @@ var config = Config{
 }
 
 func main() {
-	// 获取目标目录，默认为当前目录
-	root := "."
-	if len(os.Args) > 1 {
-		root = os.Args[1]
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(), "dir2txt %s\n", version)
+		fmt.Fprintf(flag.CommandLine.Output(), "用法: dir2txt [--dir <path> ...] [--filter <pattern> ...] [dir|filter ...]\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "示例:\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "  dir2txt --dir . ../other --filter '*.png *.jpg' '!keep.png'\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "  dir2txt --filter '*.png' --filter '!keep.png' src test\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "参数:\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "  --dir     指定要扫描的目录，可重复；也可用位置参数追加目录\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "  --filter  过滤表达式，支持 * ? [] 通配符，与 ! 反向规则；空格分割，可重复\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "  --out     指定输出文件路径或输出目录\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "  位置参数  未被 --dir 消耗的参数：若含 * ? [] 或以 ! 开头视为过滤，其它视为目录\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "  --help/-h 显示此帮助\n")
 	}
 
-	// 获取绝对路径以确定根目录名称
-	absRoot, err := filepath.Abs(root)
-	if err != nil {
-		fmt.Printf("无法获取绝对路径: %v\n", err)
+	parsedDirs, parsedFilters, outFlag, help, err := parseCommandLine()
+	if help {
+		flag.Usage()
 		return
 	}
-	rootName := filepath.Base(absRoot)
-
-	// 动态设置输出文件名: 目录名_context.md
-	config.OutputFile = fmt.Sprintf("%s_context.md", rootName)
-
-	// 创建输出文件
-	outFile, err := os.Create(config.OutputFile)
 	if err != nil {
-		fmt.Printf("无法创建输出文件: %v\n", err)
-		return
+		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	dirs := []string(parsedDirs)
+	filters := []string(parsedFilters)
+	if len(dirs) == 0 {
+		dirs = append(dirs, ".")
+	}
+
+	finalOutPath, err := determineOutputPath(dirs, outFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "错误: 无法确定输出路径: %v\n", err)
+		os.Exit(1)
+	}
+
+	config.OutputFile = filepath.Base(finalOutPath)
+	if err := os.MkdirAll(filepath.Dir(finalOutPath), 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "无法创建输出目录: %v\n", err)
+		os.Exit(1)
+	}
+
+	outFile, err := os.Create(finalOutPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "无法创建输出文件: %v\n", err)
+		os.Exit(1)
 	}
 	defer outFile.Close()
 
-	// 使用 bufio 提高写入性能
 	writer := bufio.NewWriter(outFile)
 	defer writer.Flush()
 
-	fmt.Printf("正在扫描目录: %s\n", root)
-	fmt.Printf("结果将写入: %s\n", config.OutputFile)
+	fmt.Printf("结果将写入: %s\n", finalOutPath)
 
-	// 1. 写入项目结构树
+	if err := processDirs(dirs, filters, writer, finalOutPath); err != nil {
+		fmt.Fprintf(os.Stderr, "处理目录失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("完成！")
+}
+
+func processDirs(dirs []string, filters []string, writer *bufio.Writer, finalOutPath string) error {
+	absOut, err := filepath.Abs(finalOutPath)
+	if err != nil {
+		return err
+	}
+
 	writer.WriteString("# Project Structure\n\n")
 	writer.WriteString("```text\n")
-
-	// 显示根目录名
-	writer.WriteString(rootName + "/\n")
-
-	if err := writeTree(root, "", writer); err != nil {
-		writer.WriteString(fmt.Sprintf("Error generating tree: %v\n", err))
+	for _, dir := range dirs {
+		absDir, err := filepath.Abs(dir)
+		if err != nil {
+			writer.WriteString(fmt.Sprintf("%s/\n", dir))
+			writer.WriteString(fmt.Sprintf("Error generating tree: %v\n", err))
+			continue
+		}
+		writer.WriteString(filepath.Base(absDir) + "/\n")
+		if err := writeTree(absDir, absDir, "", writer, filters); err != nil {
+			writer.WriteString(fmt.Sprintf("Error generating tree for %s: %v\n", dir, err))
+		}
+		writer.WriteString("\n")
 	}
 	writer.WriteString("```\n\n")
 	writer.WriteString("---\n\n")
 
-	// 2. 遍历文件并写入内容
 	writer.WriteString("# File Contents\n\n")
-
-	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+	var firstErr error
+	for _, dir := range dirs {
+		absDir, err := filepath.Abs(dir)
 		if err != nil {
-			return err
+			fmt.Fprintf(os.Stderr, "无法获取目录 %s 绝对路径: %v\n", dir, err)
+			firstErr = err
+			continue
 		}
-
-		name := d.Name()
-
-		// 排除输出文件自身
-		if name == config.OutputFile {
-			return nil
-		}
-
-		// 检查是否是"垃圾"目录或文件 (完全忽略，既不出现在树里也不处理内容)
-		if isJunk(name) {
-			if d.IsDir() {
-				return filepath.SkipDir
+		err = filepath.WalkDir(absDir, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
 			}
-			return nil
+
+			absPath := path
+			if absPath == absOut {
+				if d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+
+			name := d.Name()
+			if isJunk(name) {
+				if d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+
+			rel, _ := filepath.Rel(absDir, path)
+			relSlash := filepath.ToSlash(rel)
+			if relSlash == "." {
+				relSlash = ""
+			}
+			if relSlash != "" && isFiltered(relSlash, filters) {
+				if d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+
+			if d.IsDir() {
+				return nil
+			}
+
+			if isAsset(name) {
+				return nil
+			}
+
+			return processFile(path, writer)
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "处理目录 %s 时出错: %v\n", dir, err)
+			firstErr = err
 		}
-
-		// 如果是目录，继续遍历
-		if d.IsDir() {
-			return nil
-		}
-
-		// 检查是否是"资源"文件 (不处理内容，虽然它们会出现在上面的树中)
-		// 例如: 图片, 普通的exe
-		if isAsset(name) {
-			return nil
-		}
-
-		// 处理单个文件 (读取内容)
-		return processFile(path, writer)
-	})
-
-	if err != nil {
-		fmt.Printf("遍历目录时出错: %v\n", err)
-	} else {
-		fmt.Println("完成！")
 	}
+	return firstErr
 }
 
 // processFile 读取文件并格式化写入 Markdown
@@ -228,6 +442,35 @@ func processFile(path string, writer *bufio.Writer) error {
 	writer.WriteString("---\n\n")
 
 	return nil
+}
+
+// isFiltered 使用类似 gitignore 的简单通配符规则判断是否应被过滤
+// 规则：按传入顺序匹配，后匹配覆盖前匹配；前缀 ! 表示反向（取消过滤）
+func isFiltered(relPath string, filters []string) bool {
+	if relPath == "" {
+		return false
+	}
+
+	// 使用统一的正斜杠
+	norm := filepath.ToSlash(relPath)
+	ignored := false
+
+	for _, p := range filters {
+		negate := strings.HasPrefix(p, "!")
+		pat := strings.TrimPrefix(p, "!")
+		if pat == "" {
+			continue
+		}
+		matched, err := path.Match(pat, norm)
+		if err != nil {
+			continue
+		}
+		if matched {
+			ignored = !negate
+		}
+	}
+
+	return ignored
 }
 
 // isJunk 检查是否为"垃圾"文件/目录 (不应该出现在任何地方)
@@ -309,8 +552,8 @@ func convertToUTF8(content []byte) ([]byte, string, error) {
 }
 
 // writeTree 生成简单的 ASCII 目录树
-func writeTree(path string, prefix string, w *bufio.Writer) error {
-	entries, err := os.ReadDir(path)
+func writeTree(root string, current string, prefix string, w *bufio.Writer, filters []string) error {
+	entries, err := os.ReadDir(current)
 	if err != nil {
 		return err
 	}
@@ -319,6 +562,9 @@ func writeTree(path string, prefix string, w *bufio.Writer) error {
 	var visibleEntries []os.DirEntry
 	for _, entry := range entries {
 		name := entry.Name()
+		fullPath := filepath.Join(current, name)
+		rel, _ := filepath.Rel(root, fullPath)
+		relSlash := filepath.ToSlash(rel)
 
 		// 排除输出文件自身
 		if name == config.OutputFile {
@@ -327,9 +573,19 @@ func writeTree(path string, prefix string, w *bufio.Writer) error {
 
 		// 关键点：只排除"垃圾"文件 (isJunk)，不排除"资源"文件 (isAsset)
 		// 这样图片和exe文件会出现在树中
-		if !isJunk(name) {
-			visibleEntries = append(visibleEntries, entry)
+		if isJunk(name) {
+			continue
 		}
+
+		// 过滤表达式处理（对目录树也生效）
+		if relSlash != "" && isFiltered(relSlash, filters) {
+			if entry.IsDir() {
+				continue
+			}
+			continue
+		}
+
+		visibleEntries = append(visibleEntries, entry)
 	}
 
 	for i, entry := range visibleEntries {
@@ -347,7 +603,7 @@ func writeTree(path string, prefix string, w *bufio.Writer) error {
 			if isLast {
 				newPrefix = prefix + "    "
 			}
-			writeTree(filepath.Join(path, entry.Name()), newPrefix, w)
+			writeTree(root, filepath.Join(current, entry.Name()), newPrefix, w, filters)
 		}
 	}
 	return nil
