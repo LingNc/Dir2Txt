@@ -16,7 +16,7 @@ import (
 	"golang.org/x/text/transform"
 )
 
-const version = "v1.3"
+const version = "v1.4"
 
 // Config 配置需要忽略的目录和文件后缀
 type Config struct {
@@ -45,9 +45,10 @@ func (m *multiValue) Set(s string) error {
 	return nil
 }
 
-func parseCommandLine() (multiValue, multiValue, string, bool, error) {
+func parseCommandLine() (multiValue, multiValue, multiValue, string, bool, error) {
 	var dirs multiValue
-	var filters multiValue
+	var softFilters multiValue // -f / --filter / -filter : 只过滤内容，不排除树
+	var hardFilters multiValue // -F / --Filter : 完全过滤，树和内容都不出现
 	var out string
 	var help bool
 	args := os.Args[1:]
@@ -57,26 +58,34 @@ func parseCommandLine() (multiValue, multiValue, string, bool, error) {
 		switch {
 		case arg == "--" && i+1 < len(args):
 			leftover = append(leftover, args[i+1:]...)
-			i = len(args) // end parsing
-		case arg == "--dir":
+			i = len(args)
+		case arg == "--dir" || arg == "-d":
 			if i+1 >= len(args) {
-				return dirs, filters, out, help, fmt.Errorf("--dir 需要一个路径")
+				return dirs, softFilters, hardFilters, out, help, fmt.Errorf("--dir 需要一个路径")
 			}
 			i++
 			dirs.Set(args[i])
 		case strings.HasPrefix(arg, "--dir="):
 			dirs.Set(strings.TrimPrefix(arg, "--dir="))
-		case arg == "--filter":
+		case arg == "--filter" || arg == "-filter" || arg == "-f":
 			if i+1 >= len(args) {
-				return dirs, filters, out, help, fmt.Errorf("--filter 需要一个表达式")
+				return dirs, softFilters, hardFilters, out, help, fmt.Errorf("--filter 需要一个表达式")
 			}
 			i++
-			filters.Set(args[i])
-		case strings.HasPrefix(arg, "--filter="):
-			filters.Set(strings.TrimPrefix(arg, "--filter="))
-		case arg == "--out":
+			softFilters.Set(args[i])
+		case strings.HasPrefix(arg, "--filter=") || strings.HasPrefix(arg, "-filter="):
+			softFilters.Set(strings.TrimPrefix(strings.TrimPrefix(arg, "-"), "filter="))
+		case arg == "--Filter" || arg == "-Filter" || arg == "-F":
 			if i+1 >= len(args) {
-				return dirs, filters, out, help, fmt.Errorf("--out 需要一个路径")
+				return dirs, softFilters, hardFilters, out, help, fmt.Errorf("--Filter 需要一个表达式")
+			}
+			i++
+			hardFilters.Set(args[i])
+		case strings.HasPrefix(arg, "--Filter=") || strings.HasPrefix(arg, "-Filter="):
+			hardFilters.Set(strings.TrimPrefix(strings.TrimPrefix(arg, "-"), "Filter="))
+		case arg == "--out" || arg == "-o":
+			if i+1 >= len(args) {
+				return dirs, softFilters, hardFilters, out, help, fmt.Errorf("--out 需要一个路径")
 			}
 			i++
 			out = args[i]
@@ -90,12 +99,12 @@ func parseCommandLine() (multiValue, multiValue, string, bool, error) {
 	}
 	for _, arg := range leftover {
 		if strings.HasPrefix(arg, "!") || strings.ContainsAny(arg, "*?[]") {
-			filters.Set(arg)
+			softFilters.Set(arg)
 			continue
 		}
 		dirs.Set(arg)
 	}
-	return dirs, filters, out, help, nil
+	return dirs, softFilters, hardFilters, out, help, nil
 }
 
 // determineOutputPath 计算最终的输出文件路径
@@ -236,15 +245,17 @@ func main() {
 		fmt.Fprintf(flag.CommandLine.Output(), "示例:\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  dir2txt --dir . ../other --filter '*.png *.jpg' '!keep.png'\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  dir2txt --filter '*.png' --filter '!keep.png' src test\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "  dir2txt -F 'dist/**' -f '*.png' src\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "参数:\n")
-		fmt.Fprintf(flag.CommandLine.Output(), "  --dir     指定要扫描的目录，可重复；也可用位置参数追加目录\n")
-		fmt.Fprintf(flag.CommandLine.Output(), "  --filter  过滤表达式，支持 * ? [] 通配符，与 ! 反向规则；空格分割，可重复\n")
-		fmt.Fprintf(flag.CommandLine.Output(), "  --out     指定输出文件路径或输出目录\n")
-		fmt.Fprintf(flag.CommandLine.Output(), "  位置参数  未被 --dir 消耗的参数：若含 * ? [] 或以 ! 开头视为过滤，其它视为目录\n")
-		fmt.Fprintf(flag.CommandLine.Output(), "  --help/-h 显示此帮助\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "  --dir/-d      指定要扫描的目录，可重复；也可用位置参数追加目录\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "  --filter/-f   软过滤：仅跳过文件内容输出，目录和树仍显示；支持 * ? [] 与 ! 反向\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "  --Filter/-F   硬过滤：目录树和文件内容都不显示；支持 * ? [] 与 ! 反向\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "  --out/-o      指定输出文件路径或输出目录\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "  位置参数      未被 --dir 消耗的参数：若含 * ? [] 或以 ! 开头视为软过滤，其它视为目录\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "  --help/-h     显示此帮助\n")
 	}
 
-	parsedDirs, parsedFilters, outFlag, help, err := parseCommandLine()
+	parsedDirs, parsedSoftFilters, parsedHardFilters, outFlag, help, err := parseCommandLine()
 	if help {
 		flag.Usage()
 		return
@@ -256,7 +267,8 @@ func main() {
 	}
 
 	dirs := []string(parsedDirs)
-	filters := []string(parsedFilters)
+	softFilters := []string(parsedSoftFilters)
+	hardFilters := []string(parsedHardFilters)
 	if len(dirs) == 0 {
 		dirs = append(dirs, ".")
 	}
@@ -285,7 +297,7 @@ func main() {
 
 	fmt.Printf("结果将写入: %s\n", finalOutPath)
 
-	if err := processDirs(dirs, filters, writer, finalOutPath); err != nil {
+	if err := processDirs(dirs, softFilters, hardFilters, writer, finalOutPath); err != nil {
 		fmt.Fprintf(os.Stderr, "处理目录失败: %v\n", err)
 		os.Exit(1)
 	}
@@ -293,7 +305,7 @@ func main() {
 	fmt.Println("完成！")
 }
 
-func processDirs(dirs []string, filters []string, writer *bufio.Writer, finalOutPath string) error {
+func processDirs(dirs []string, softFilters []string, hardFilters []string, writer *bufio.Writer, finalOutPath string) error {
 	absOut, err := filepath.Abs(finalOutPath)
 	if err != nil {
 		return err
@@ -309,7 +321,7 @@ func processDirs(dirs []string, filters []string, writer *bufio.Writer, finalOut
 			continue
 		}
 		writer.WriteString(filepath.Base(absDir) + "/\n")
-		if err := writeTree(absDir, absDir, "", writer, filters); err != nil {
+		if err := writeTree(absDir, absDir, "", writer, hardFilters); err != nil {
 			writer.WriteString(fmt.Sprintf("Error generating tree for %s: %v\n", dir, err))
 		}
 		writer.WriteString("\n")
@@ -352,7 +364,7 @@ func processDirs(dirs []string, filters []string, writer *bufio.Writer, finalOut
 			if relSlash == "." {
 				relSlash = ""
 			}
-			if relSlash != "" && isFiltered(relSlash, filters) {
+			if relSlash != "" && isFiltered(relSlash, hardFilters) {
 				if d.IsDir() {
 					return filepath.SkipDir
 				}
@@ -363,7 +375,7 @@ func processDirs(dirs []string, filters []string, writer *bufio.Writer, finalOut
 				return nil
 			}
 
-			if isAsset(name) {
+			if isAsset(name) || (relSlash != "" && isFiltered(relSlash, softFilters)) {
 				return nil
 			}
 
@@ -552,7 +564,7 @@ func convertToUTF8(content []byte) ([]byte, string, error) {
 }
 
 // writeTree 生成简单的 ASCII 目录树
-func writeTree(root string, current string, prefix string, w *bufio.Writer, filters []string) error {
+func writeTree(root string, current string, prefix string, w *bufio.Writer, hardFilters []string) error {
 	entries, err := os.ReadDir(current)
 	if err != nil {
 		return err
@@ -577,8 +589,8 @@ func writeTree(root string, current string, prefix string, w *bufio.Writer, filt
 			continue
 		}
 
-		// 过滤表达式处理（对目录树也生效）
-		if relSlash != "" && isFiltered(relSlash, filters) {
+		// 过滤表达式处理（对目录树也生效，仅使用 hardFilters）
+		if relSlash != "" && isFiltered(relSlash, hardFilters) {
 			if entry.IsDir() {
 				continue
 			}
@@ -603,7 +615,7 @@ func writeTree(root string, current string, prefix string, w *bufio.Writer, filt
 			if isLast {
 				newPrefix = prefix + "    "
 			}
-			writeTree(root, filepath.Join(current, entry.Name()), newPrefix, w, filters)
+			writeTree(root, filepath.Join(current, entry.Name()), newPrefix, w, hardFilters)
 		}
 	}
 	return nil
