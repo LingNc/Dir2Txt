@@ -375,7 +375,7 @@ func processDirs(dirs []string, softFilters []string, hardFilters []string, writ
 				return nil
 			}
 
-			if isAsset(name) || (relSlash != "" && isFiltered(relSlash, softFilters)) {
+			if isAsset(name) || isFiltered(relSlash, softFilters) || isFiltered(name, softFilters) {
 				return nil
 			}
 
