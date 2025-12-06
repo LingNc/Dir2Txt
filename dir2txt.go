@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -16,7 +17,12 @@ import (
 	"golang.org/x/text/transform"
 )
 
-const version = "v1.4"
+const (
+	version         = "v1.5"
+	maxDisplayFiles = 24
+	keepHeadFiles   = 8
+	keepTailFiles   = 8
+)
 
 // Config 配置需要忽略的目录和文件后缀
 type Config struct {
@@ -26,6 +32,70 @@ type Config struct {
 	IgnoredFiles map[string]bool // 指定要完全隐藏的文件 (既不在树中显示，也不读取内容)
 	MaxFileSize  int64           // 忽略过大的文件
 	TextExts     map[string]bool // 强制视为文本的文件后缀
+}
+
+// walkFollowSymlinks 遍历目录，跟随符号链接的目录，保持逻辑路径用于过滤
+func walkFollowSymlinks(root string, fn func(logicalRel string, fullPath string, d os.DirEntry) error) error {
+	type node struct {
+		fsPath string // 实际文件系统路径（可能为解析后的目标路径）
+		rel    string // 相对 root 的逻辑路径（使用符号链接名字串接）
+	}
+
+	stack := []node{{fsPath: root, rel: ""}}
+	seen := map[string]bool{}
+
+	for len(stack) > 0 {
+		n := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		entries, err := os.ReadDir(n.fsPath)
+		if err != nil {
+			return err
+		}
+
+		for _, entry := range entries {
+			name := entry.Name()
+			logicalRel := name
+			if n.rel != "" {
+				logicalRel = filepath.Join(n.rel, name)
+			}
+
+			childFSPath := filepath.Join(n.fsPath, name)
+			childIsDir := entry.IsDir()
+
+			// 跟随符号链接目录
+			if entry.Type()&os.ModeSymlink != 0 {
+				target, err := filepath.EvalSymlinks(childFSPath)
+				if err == nil {
+					if info, err := os.Stat(target); err == nil && info.IsDir() {
+						childIsDir = true
+						childFSPath = target
+					}
+				}
+			}
+
+			// 先把当前条目交给回调
+			if err := fn(logicalRel, childFSPath, entry); err != nil {
+				if errors.Is(err, filepath.SkipDir) {
+					continue
+				}
+				return err
+			}
+
+			if childIsDir {
+				real, err := filepath.EvalSymlinks(childFSPath)
+				if err == nil {
+					if seen[real] {
+						continue
+					}
+					seen[real] = true
+				}
+				stack = append(stack, node{fsPath: childFSPath, rel: logicalRel})
+			}
+		}
+	}
+
+	return nil
 }
 
 // multiValue 允许通过空格或多次传参传入多个值，例如：
@@ -44,6 +114,17 @@ func (m *multiValue) Set(s string) error {
 	*m = append(*m, parts...)
 	return nil
 }
+
+// SimpleDirEntry 用于在目录树中创建伪造节点（如省略号）
+type SimpleDirEntry struct {
+	name  string
+	isDir bool
+}
+
+func (e *SimpleDirEntry) Name() string               { return e.name }
+func (e *SimpleDirEntry) IsDir() bool                { return e.isDir }
+func (e *SimpleDirEntry) Type() os.FileMode          { return 0 }
+func (e *SimpleDirEntry) Info() (os.FileInfo, error) { return nil, nil }
 
 func parseCommandLine() (multiValue, multiValue, multiValue, string, bool, error) {
 	var dirs multiValue
@@ -321,7 +402,7 @@ func processDirs(dirs []string, softFilters []string, hardFilters []string, writ
 			continue
 		}
 		writer.WriteString(filepath.Base(absDir) + "/\n")
-		if err := writeTree(absDir, absDir, "", writer, hardFilters); err != nil {
+		if err := writeTree(absDir, absDir, absDir, absDir, "", writer, hardFilters, map[string]bool{}); err != nil {
 			writer.WriteString(fmt.Sprintf("Error generating tree for %s: %v\n", dir, err))
 		}
 		writer.WriteString("\n")
@@ -338,12 +419,9 @@ func processDirs(dirs []string, softFilters []string, hardFilters []string, writ
 			firstErr = err
 			continue
 		}
-		err = filepath.WalkDir(absDir, func(path string, d os.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-
-			absPath := path
+		err = walkFollowSymlinks(absDir, func(logicalRel string, fullPath string, d os.DirEntry) error {
+			// 排除输出文件自身
+			absPath := fullPath
 			if absPath == absOut {
 				if d.IsDir() {
 					return filepath.SkipDir
@@ -359,8 +437,7 @@ func processDirs(dirs []string, softFilters []string, hardFilters []string, writ
 				return nil
 			}
 
-			rel, _ := filepath.Rel(absDir, path)
-			relSlash := filepath.ToSlash(rel)
+			relSlash := filepath.ToSlash(logicalRel)
 			if relSlash == "." {
 				relSlash = ""
 			}
@@ -379,7 +456,7 @@ func processDirs(dirs []string, softFilters []string, hardFilters []string, writ
 				return nil
 			}
 
-			return processFile(path, writer)
+			return processFile(fullPath, writer)
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "处理目录 %s 时出错: %v\n", dir, err)
@@ -394,6 +471,12 @@ func processFile(path string, writer *bufio.Writer) error {
 	// 1. 获取文件信息与大小检查
 	info, err := os.Stat(path)
 	if err != nil {
+		return nil
+	}
+
+	// 软链接指向目录时跳过内容读取
+	if info.IsDir() {
+		fmt.Printf("[SKIP] 软链接指向目录: %s\n", path)
 		return nil
 	}
 	if info.Size() > config.MaxFileSize {
@@ -563,9 +646,9 @@ func convertToUTF8(content []byte) ([]byte, string, error) {
 	return nil, "Unknown", fmt.Errorf("encoding not recognized")
 }
 
-// writeTree 生成简单的 ASCII 目录树
-func writeTree(root string, current string, prefix string, w *bufio.Writer, hardFilters []string) error {
-	entries, err := os.ReadDir(current)
+// writeTree 生成简单的 ASCII 目录树，支持文件折叠，跟随符号链接目录但使用逻辑路径做过滤
+func writeTree(rootFS string, rootLogical string, currentFS string, currentLogical string, prefix string, w *bufio.Writer, hardFilters []string, seen map[string]bool) error {
+	entries, err := os.ReadDir(currentFS)
 	if err != nil {
 		return err
 	}
@@ -574,8 +657,8 @@ func writeTree(root string, current string, prefix string, w *bufio.Writer, hard
 	var visibleEntries []os.DirEntry
 	for _, entry := range entries {
 		name := entry.Name()
-		fullPath := filepath.Join(current, name)
-		rel, _ := filepath.Rel(root, fullPath)
+		logicalPath := filepath.Join(currentLogical, name)
+		rel, _ := filepath.Rel(rootLogical, logicalPath)
 		relSlash := filepath.ToSlash(rel)
 
 		// 排除输出文件自身
@@ -600,22 +683,76 @@ func writeTree(root string, current string, prefix string, w *bufio.Writer, hard
 		visibleEntries = append(visibleEntries, entry)
 	}
 
-	for i, entry := range visibleEntries {
-		isLast := i == len(visibleEntries)-1
+	// 分离目录与文件，文件过多时折叠
+	var dirs []os.DirEntry
+	var files []os.DirEntry
+	for _, e := range visibleEntries {
+		if e.IsDir() {
+			dirs = append(dirs, e)
+		} else {
+			files = append(files, e)
+		}
+	}
+
+	if len(files) > maxDisplayFiles {
+		display := make([]os.DirEntry, 0, keepHeadFiles+keepTailFiles+1)
+		display = append(display, files[:keepHeadFiles]...)
+		hiddenCount := len(files) - keepHeadFiles - keepTailFiles
+		if hiddenCount < 0 {
+			hiddenCount = 0
+		}
+		display = append(display, &SimpleDirEntry{name: fmt.Sprintf("... (%d files hidden) ...", hiddenCount)})
+		display = append(display, files[len(files)-keepTailFiles:]...)
+		files = display
+	}
+
+	finalEntries := make([]os.DirEntry, 0, len(dirs)+len(files))
+	finalEntries = append(finalEntries, dirs...)
+	finalEntries = append(finalEntries, files...)
+
+	for i, entry := range finalEntries {
+		isLast := i == len(finalEntries)-1
 
 		marker := "├── "
 		if isLast {
 			marker = "└── "
 		}
 
-		w.WriteString(prefix + marker + entry.Name() + "\n")
+		displayName := entry.Name()
+		if entry.Type()&os.ModeSymlink != 0 {
+			fullPath := filepath.Join(currentFS, entry.Name())
+			if target, err := os.Readlink(fullPath); err == nil {
+				displayName = fmt.Sprintf("%s -> %s", displayName, target)
+			}
+		}
 
-		if entry.IsDir() {
+		w.WriteString(prefix + marker + displayName + "\n")
+
+		childPathFS := filepath.Join(currentFS, entry.Name())
+		childPathLogical := filepath.Join(currentLogical, entry.Name())
+		childIsDir := entry.IsDir()
+		if entry.Type()&os.ModeSymlink != 0 {
+			if target, err := filepath.EvalSymlinks(childPathFS); err == nil {
+				if info, err := os.Stat(target); err == nil && info.IsDir() {
+					childIsDir = true
+					childPathFS = target
+				}
+			}
+		}
+
+		if childIsDir {
+			real, err := filepath.EvalSymlinks(childPathFS)
+			if err == nil {
+				if seen[real] {
+					continue
+				}
+				seen[real] = true
+			}
 			newPrefix := prefix + "│   "
 			if isLast {
 				newPrefix = prefix + "    "
 			}
-			writeTree(root, filepath.Join(current, entry.Name()), newPrefix, w, hardFilters)
+			writeTree(rootFS, rootLogical, childPathFS, childPathLogical, newPrefix, w, hardFilters, seen)
 		}
 	}
 	return nil
