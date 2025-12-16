@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	version         = "v1.5"
+	version         = "v1.6"
 	maxDisplayFiles = 24
 	keepHeadFiles   = 8
 	keepTailFiles   = 8
@@ -32,6 +32,7 @@ type Config struct {
 	IgnoredFiles map[string]bool // 指定要完全隐藏的文件 (既不在树中显示，也不读取内容)
 	MaxFileSize  int64           // 忽略过大的文件
 	TextExts     map[string]bool // 强制视为文本的文件后缀
+	NoFold       bool            // 是否关闭目录树文件折叠
 }
 
 // walkFollowSymlinks 遍历目录，跟随符号链接的目录，保持逻辑路径用于过滤
@@ -140,6 +141,56 @@ func parseCommandLine() (multiValue, multiValue, multiValue, string, bool, error
 		case arg == "--" && i+1 < len(args):
 			leftover = append(leftover, args[i+1:]...)
 			i = len(args)
+		case arg == "--no-fold":
+			config.NoFold = true
+		case arg == "--config" || arg == "-c" || arg == "-fc":
+			if i+1 >= len(args) {
+				return dirs, softFilters, hardFilters, out, help, fmt.Errorf("--config 需要一个文件路径")
+			}
+			i++
+			patterns, err := loadPatternsFromFile(args[i])
+			if err != nil {
+				return dirs, softFilters, hardFilters, out, help, err
+			}
+			for _, p := range patterns {
+				softFilters = append(softFilters, p)
+			}
+		case strings.HasPrefix(arg, "--config="):
+			patterns, err := loadPatternsFromFile(strings.TrimPrefix(arg, "--config="))
+			if err != nil {
+				return dirs, softFilters, hardFilters, out, help, err
+			}
+			for _, p := range patterns {
+				softFilters = append(softFilters, p)
+			}
+		case strings.HasPrefix(arg, "-fc="):
+			patterns, err := loadPatternsFromFile(strings.TrimPrefix(arg, "-fc="))
+			if err != nil {
+				return dirs, softFilters, hardFilters, out, help, err
+			}
+			for _, p := range patterns {
+				softFilters = append(softFilters, p)
+			}
+		case arg == "-Fc":
+			if i+1 >= len(args) {
+				return dirs, softFilters, hardFilters, out, help, fmt.Errorf("-Fc 需要一个文件路径")
+			}
+			i++
+			patterns, err := loadPatternsFromFile(args[i])
+			if err != nil {
+				return dirs, softFilters, hardFilters, out, help, err
+			}
+			for _, p := range patterns {
+				hardFilters = append(hardFilters, p)
+			}
+		case strings.HasPrefix(arg, "-Fc="):
+			patterns, err := loadPatternsFromFile(strings.TrimPrefix(arg, "-Fc="))
+			if err != nil {
+				return dirs, softFilters, hardFilters, out, help, err
+			}
+			for _, p := range patterns {
+				hardFilters = append(hardFilters, p)
+			}
 		case arg == "--dir" || arg == "-d":
 			consumed := 0
 			for i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
@@ -216,6 +267,31 @@ func normalizeFilters(filters []string) []string {
 		out = append(out, f)
 	}
 	return out
+}
+
+func loadPatternsFromFile(filePath string) ([]string, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("无法读取配置文件 %s: %w", filePath, err)
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	var patterns []string
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		patterns = append(patterns, line)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("读取配置文件 %s 失败: %w", filePath, err)
+	}
+	return patterns, nil
 }
 
 // determineOutputPath 计算最终的输出文件路径
@@ -363,6 +439,7 @@ func main() {
 		fmt.Fprintf(flag.CommandLine.Output(), "  --Filter/-F   硬过滤：目录树和文件内容都不显示；支持 * ? [] 与 ! 反向\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  Pattern 语法: ? 单字符 (test?.log); * 任意串 (*.go); [] 字符范围 (file[0-9].txt); 前缀 ! 取反 (!important.txt)\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  --out/-o      指定输出文件路径或输出目录\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "  --no-fold     在目录树中不折叠长文件列表，始终显示全部文件 (默认超过 %d 个文件折叠)\n", maxDisplayFiles)
 		fmt.Fprintf(flag.CommandLine.Output(), "  位置参数      未被 --dir 消耗的参数：若含 * ? [] 或以 ! 开头视为软过滤，其它视为目录\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  --help/-h     显示此帮助\n")
 	}
@@ -472,26 +549,36 @@ func processDirs(dirs []string, softFilters []string, hardFilters []string, writ
 			if relSlash == "." {
 				relSlash = ""
 			}
+
 			if relSlash != "" {
-				matched, _ := checkFilter(relSlash, hardFilters)
-				if matched {
+				matchedHard, _ := checkFilter(relSlash, hardFilters)
+				if matchedHard {
 					if d.IsDir() {
 						return filepath.SkipDir
 					}
 					return nil
 				}
-
-				if d.IsDir() {
-					return nil
-				}
 			}
 
-			if isAsset(name) {
+			matchedSoft, rule := checkFilter(relSlash, softFilters)
+			if matchedSoft {
+				display := relSlash
+				if display == "" {
+					display = filepath.ToSlash(fullPath)
+				}
+				if d.IsDir() {
+					fmt.Printf("[SKIP] 忽略目录 (Soft Filter: \"%s\"): %s\n", rule, display)
+					return filepath.SkipDir
+				}
+				fmt.Printf("[SKIP] 忽略内容 (Soft Filter: \"%s\"): %s\n", rule, display)
 				return nil
 			}
 
-			matchedSoft, _ := checkFilter(relSlash, softFilters)
-			if matchedSoft {
+			if d.IsDir() {
+				return nil
+			}
+
+			if isAsset(name) {
 				return nil
 			}
 
@@ -760,7 +847,7 @@ func writeTree(rootFS string, rootLogical string, currentFS string, currentLogic
 		}
 	}
 
-	if len(files) > maxDisplayFiles {
+	if !config.NoFold && len(files) > maxDisplayFiles {
 		display := make([]os.DirEntry, 0, keepHeadFiles+keepTailFiles+1)
 		display = append(display, files[:keepHeadFiles]...)
 		hiddenCount := len(files) - keepHeadFiles - keepTailFiles
