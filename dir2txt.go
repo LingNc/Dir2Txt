@@ -141,27 +141,39 @@ func parseCommandLine() (multiValue, multiValue, multiValue, string, bool, error
 			leftover = append(leftover, args[i+1:]...)
 			i = len(args)
 		case arg == "--dir" || arg == "-d":
-			if i+1 >= len(args) {
+			consumed := 0
+			for i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				i++
+				dirs.Set(args[i])
+				consumed++
+			}
+			if consumed == 0 {
 				return dirs, softFilters, hardFilters, out, help, fmt.Errorf("--dir 需要一个路径")
 			}
-			i++
-			dirs.Set(args[i])
 		case strings.HasPrefix(arg, "--dir="):
 			dirs.Set(strings.TrimPrefix(arg, "--dir="))
 		case arg == "--filter" || arg == "-filter" || arg == "-f":
-			if i+1 >= len(args) {
+			consumed := 0
+			for i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				i++
+				softFilters.Set(args[i])
+				consumed++
+			}
+			if consumed == 0 {
 				return dirs, softFilters, hardFilters, out, help, fmt.Errorf("--filter 需要一个表达式")
 			}
-			i++
-			softFilters.Set(args[i])
 		case strings.HasPrefix(arg, "--filter=") || strings.HasPrefix(arg, "-filter="):
 			softFilters.Set(strings.TrimPrefix(strings.TrimPrefix(arg, "-"), "filter="))
 		case arg == "--Filter" || arg == "-Filter" || arg == "-F":
-			if i+1 >= len(args) {
+			consumed := 0
+			for i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				i++
+				hardFilters.Set(args[i])
+				consumed++
+			}
+			if consumed == 0 {
 				return dirs, softFilters, hardFilters, out, help, fmt.Errorf("--Filter 需要一个表达式")
 			}
-			i++
-			hardFilters.Set(args[i])
 		case strings.HasPrefix(arg, "--Filter=") || strings.HasPrefix(arg, "-Filter="):
 			hardFilters.Set(strings.TrimPrefix(strings.TrimPrefix(arg, "-"), "Filter="))
 		case arg == "--out" || arg == "-o":
@@ -186,6 +198,24 @@ func parseCommandLine() (multiValue, multiValue, multiValue, string, bool, error
 		dirs.Set(arg)
 	}
 	return dirs, softFilters, hardFilters, out, help, nil
+}
+
+func normalizeFilters(filters []string) []string {
+	var out []string
+	for _, f := range filters {
+		if f == "" {
+			continue
+		}
+		f = strings.ReplaceAll(f, "\\", "/")
+		if strings.HasSuffix(f, "/*") {
+			base := strings.TrimSuffix(f, "/*")
+			f = base + "/*"
+		} else {
+			f = strings.TrimSuffix(f, "/")
+		}
+		out = append(out, f)
+	}
+	return out
 }
 
 // determineOutputPath 计算最终的输出文件路径
@@ -331,6 +361,7 @@ func main() {
 		fmt.Fprintf(flag.CommandLine.Output(), "  --dir/-d      指定要扫描的目录，可重复；也可用位置参数追加目录\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  --filter/-f   软过滤：仅跳过文件内容输出，目录和树仍显示；支持 * ? [] 与 ! 反向\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  --Filter/-F   硬过滤：目录树和文件内容都不显示；支持 * ? [] 与 ! 反向\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "  Pattern 语法: ? 单字符 (test?.log); * 任意串 (*.go); [] 字符范围 (file[0-9].txt); 前缀 ! 取反 (!important.txt)\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  --out/-o      指定输出文件路径或输出目录\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  位置参数      未被 --dir 消耗的参数：若含 * ? [] 或以 ! 开头视为软过滤，其它视为目录\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  --help/-h     显示此帮助\n")
@@ -348,8 +379,8 @@ func main() {
 	}
 
 	dirs := []string(parsedDirs)
-	softFilters := []string(parsedSoftFilters)
-	hardFilters := []string(parsedHardFilters)
+	softFilters := normalizeFilters([]string(parsedSoftFilters))
+	hardFilters := normalizeFilters([]string(parsedHardFilters))
 	if len(dirs) == 0 {
 		dirs = append(dirs, ".")
 	}
@@ -441,18 +472,26 @@ func processDirs(dirs []string, softFilters []string, hardFilters []string, writ
 			if relSlash == "." {
 				relSlash = ""
 			}
-			if relSlash != "" && isFiltered(relSlash, hardFilters) {
-				if d.IsDir() {
-					return filepath.SkipDir
+			if relSlash != "" {
+				matched, _ := checkFilter(relSlash, hardFilters)
+				if matched {
+					if d.IsDir() {
+						return filepath.SkipDir
+					}
+					return nil
 				}
+
+				if d.IsDir() {
+					return nil
+				}
+			}
+
+			if isAsset(name) {
 				return nil
 			}
 
-			if d.IsDir() {
-				return nil
-			}
-
-			if isAsset(name) || isFiltered(relSlash, softFilters) || isFiltered(name, softFilters) {
+			matchedSoft, _ := checkFilter(relSlash, softFilters)
+			if matchedSoft {
 				return nil
 			}
 
@@ -539,33 +578,59 @@ func processFile(path string, writer *bufio.Writer) error {
 	return nil
 }
 
-// isFiltered 使用类似 gitignore 的简单通配符规则判断是否应被过滤
-// 规则：按传入顺序匹配，后匹配覆盖前匹配；前缀 ! 表示反向（取消过滤）
-func isFiltered(relPath string, filters []string) bool {
-	if relPath == "" {
-		return false
+// checkFilter 检查路径是否命中过滤规则，返回是否匹配以及命中的原始规则
+// 规则：
+// - dir 或 dir/ : 目录前缀匹配，目录本身和其子孙均命中
+// - dir/*       : 目录下的内容命中，目录本身不命中（保留空目录）
+// - glob        : 尝试匹配全路径或文件名
+// - ! 前缀      : 取反（豁免）
+func checkFilter(fullPath string, filters []string) (bool, string) {
+	if fullPath == "" {
+		return false, ""
 	}
 
-	// 使用统一的正斜杠
-	norm := filepath.ToSlash(relPath)
-	ignored := false
+	full := filepath.ToSlash(fullPath)
 
-	for _, p := range filters {
-		negate := strings.HasPrefix(p, "!")
-		pat := strings.TrimPrefix(p, "!")
-		if pat == "" {
+	for _, rule := range filters {
+		if rule == "" {
 			continue
 		}
-		matched, err := path.Match(pat, norm)
-		if err != nil {
-			continue
+
+		isNeg := strings.HasPrefix(rule, "!")
+		cleanRule := strings.TrimPrefix(rule, "!")
+		cleanRule = filepath.ToSlash(cleanRule)
+
+		matched := false
+
+		if strings.HasSuffix(cleanRule, "/*") {
+			parent := strings.TrimSuffix(cleanRule, "/*")
+			if parent != "" && strings.HasPrefix(full, parent+"/") && full != parent {
+				matched = true
+			}
+		} else {
+			cleanRule = strings.TrimSuffix(cleanRule, "/")
+
+			if cleanRule != "" && (full == cleanRule || strings.HasPrefix(full, cleanRule+"/")) {
+				matched = true
+			} else {
+				if m, _ := path.Match(cleanRule, full); m {
+					matched = true
+				}
+				if m, _ := path.Match(cleanRule, filepath.Base(full)); m {
+					matched = true
+				}
+			}
 		}
+
 		if matched {
-			ignored = !negate
+			if isNeg {
+				return false, rule
+			}
+			return true, rule
 		}
 	}
 
-	return ignored
+	return false, ""
 }
 
 // isJunk 检查是否为"垃圾"文件/目录 (不应该出现在任何地方)
@@ -673,11 +738,12 @@ func writeTree(rootFS string, rootLogical string, currentFS string, currentLogic
 		}
 
 		// 过滤表达式处理（对目录树也生效，仅使用 hardFilters）
-		if relSlash != "" && isFiltered(relSlash, hardFilters) {
-			if entry.IsDir() {
+		if relSlash != "" {
+			matched, _ := checkFilter(relSlash, hardFilters)
+			if matched {
+				// 目录层保留，但被匹配的子节点会被隐藏
 				continue
 			}
-			continue
 		}
 
 		visibleEntries = append(visibleEntries, entry)
