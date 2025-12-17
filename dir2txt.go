@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	version         = "v1.6"
+	version         = "v1.6.2"
 	maxDisplayFiles = 24
 	keepHeadFiles   = 8
 	keepTailFiles   = 8
@@ -116,6 +116,22 @@ func (m *multiValue) Set(s string) error {
 	return nil
 }
 
+// rawStringList 用于存储目录路径，不做空格拆分
+// 解决含空格目录名被拆成多个参数的问题
+type rawStringList []string
+
+func (m *rawStringList) String() string {
+	return strings.Join(*m, ",")
+}
+
+func (m *rawStringList) Set(s string) error {
+	if s == "" {
+		return nil
+	}
+	*m = append(*m, s)
+	return nil
+}
+
 // SimpleDirEntry 用于在目录树中创建伪造节点（如省略号）
 type SimpleDirEntry struct {
 	name  string
@@ -127,8 +143,8 @@ func (e *SimpleDirEntry) IsDir() bool                { return e.isDir }
 func (e *SimpleDirEntry) Type() os.FileMode          { return 0 }
 func (e *SimpleDirEntry) Info() (os.FileInfo, error) { return nil, nil }
 
-func parseCommandLine() (multiValue, multiValue, multiValue, string, bool, error) {
-	var dirs multiValue
+func parseCommandLine() (rawStringList, multiValue, multiValue, string, bool, error) {
+	var dirs rawStringList
 	var softFilters multiValue // -f / --filter / -filter : 只过滤内容，不排除树
 	var hardFilters multiValue // -F / --Filter : 完全过滤，树和内容都不出现
 	var out string
