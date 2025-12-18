@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"unicode/utf8"
 
@@ -18,7 +20,7 @@ import (
 )
 
 const (
-	version         = "v1.6.2"
+	version         = "v1.7.0"
 	maxDisplayFiles = 24
 	keepHeadFiles   = 8
 	keepTailFiles   = 8
@@ -143,12 +145,14 @@ func (e *SimpleDirEntry) IsDir() bool                { return e.isDir }
 func (e *SimpleDirEntry) Type() os.FileMode          { return 0 }
 func (e *SimpleDirEntry) Info() (os.FileInfo, error) { return nil, nil }
 
-func parseCommandLine() (rawStringList, multiValue, multiValue, string, bool, error) {
+func parseCommandLine() (rawStringList, multiValue, multiValue, string, bool, bool, bool, error) {
 	var dirs rawStringList
 	var softFilters multiValue // -f / --filter / -filter : 只过滤内容，不排除树
 	var hardFilters multiValue // -F / --Filter : 完全过滤，树和内容都不出现
 	var out string
 	var help bool
+	var install bool
+	var uninstall bool
 	args := os.Args[1:]
 	var leftover []string
 	for i := 0; i < len(args); i++ {
@@ -157,16 +161,20 @@ func parseCommandLine() (rawStringList, multiValue, multiValue, string, bool, er
 		case arg == "--" && i+1 < len(args):
 			leftover = append(leftover, args[i+1:]...)
 			i = len(args)
+		case arg == "--install":
+			install = true
+		case arg == "--uninstall":
+			uninstall = true
 		case arg == "--no-fold":
 			config.NoFold = true
 		case arg == "--config" || arg == "-c" || arg == "-fc":
 			if i+1 >= len(args) {
-				return dirs, softFilters, hardFilters, out, help, fmt.Errorf("--config 需要一个文件路径")
+				return dirs, softFilters, hardFilters, out, help, install, uninstall, fmt.Errorf("--config 需要一个文件路径")
 			}
 			i++
 			patterns, err := loadPatternsFromFile(args[i])
 			if err != nil {
-				return dirs, softFilters, hardFilters, out, help, err
+				return dirs, softFilters, hardFilters, out, help, install, uninstall, err
 			}
 			for _, p := range patterns {
 				softFilters = append(softFilters, p)
@@ -174,7 +182,7 @@ func parseCommandLine() (rawStringList, multiValue, multiValue, string, bool, er
 		case strings.HasPrefix(arg, "--config="):
 			patterns, err := loadPatternsFromFile(strings.TrimPrefix(arg, "--config="))
 			if err != nil {
-				return dirs, softFilters, hardFilters, out, help, err
+				return dirs, softFilters, hardFilters, out, help, install, uninstall, err
 			}
 			for _, p := range patterns {
 				softFilters = append(softFilters, p)
@@ -182,19 +190,19 @@ func parseCommandLine() (rawStringList, multiValue, multiValue, string, bool, er
 		case strings.HasPrefix(arg, "-fc="):
 			patterns, err := loadPatternsFromFile(strings.TrimPrefix(arg, "-fc="))
 			if err != nil {
-				return dirs, softFilters, hardFilters, out, help, err
+				return dirs, softFilters, hardFilters, out, help, install, uninstall, err
 			}
 			for _, p := range patterns {
 				softFilters = append(softFilters, p)
 			}
 		case arg == "-Fc":
 			if i+1 >= len(args) {
-				return dirs, softFilters, hardFilters, out, help, fmt.Errorf("-Fc 需要一个文件路径")
+				return dirs, softFilters, hardFilters, out, help, install, uninstall, fmt.Errorf("-Fc 需要一个文件路径")
 			}
 			i++
 			patterns, err := loadPatternsFromFile(args[i])
 			if err != nil {
-				return dirs, softFilters, hardFilters, out, help, err
+				return dirs, softFilters, hardFilters, out, help, install, uninstall, err
 			}
 			for _, p := range patterns {
 				hardFilters = append(hardFilters, p)
@@ -202,7 +210,7 @@ func parseCommandLine() (rawStringList, multiValue, multiValue, string, bool, er
 		case strings.HasPrefix(arg, "-Fc="):
 			patterns, err := loadPatternsFromFile(strings.TrimPrefix(arg, "-Fc="))
 			if err != nil {
-				return dirs, softFilters, hardFilters, out, help, err
+				return dirs, softFilters, hardFilters, out, help, install, uninstall, err
 			}
 			for _, p := range patterns {
 				hardFilters = append(hardFilters, p)
@@ -215,7 +223,7 @@ func parseCommandLine() (rawStringList, multiValue, multiValue, string, bool, er
 				consumed++
 			}
 			if consumed == 0 {
-				return dirs, softFilters, hardFilters, out, help, fmt.Errorf("--dir 需要一个路径")
+				return dirs, softFilters, hardFilters, out, help, install, uninstall, fmt.Errorf("--dir 需要一个路径")
 			}
 		case strings.HasPrefix(arg, "--dir="):
 			dirs.Set(strings.TrimPrefix(arg, "--dir="))
@@ -227,7 +235,7 @@ func parseCommandLine() (rawStringList, multiValue, multiValue, string, bool, er
 				consumed++
 			}
 			if consumed == 0 {
-				return dirs, softFilters, hardFilters, out, help, fmt.Errorf("--filter 需要一个表达式")
+				return dirs, softFilters, hardFilters, out, help, install, uninstall, fmt.Errorf("--filter 需要一个表达式")
 			}
 		case strings.HasPrefix(arg, "--filter=") || strings.HasPrefix(arg, "-filter="):
 			softFilters.Set(strings.TrimPrefix(strings.TrimPrefix(arg, "-"), "filter="))
@@ -239,13 +247,13 @@ func parseCommandLine() (rawStringList, multiValue, multiValue, string, bool, er
 				consumed++
 			}
 			if consumed == 0 {
-				return dirs, softFilters, hardFilters, out, help, fmt.Errorf("--Filter 需要一个表达式")
+				return dirs, softFilters, hardFilters, out, help, install, uninstall, fmt.Errorf("--Filter 需要一个表达式")
 			}
 		case strings.HasPrefix(arg, "--Filter=") || strings.HasPrefix(arg, "-Filter="):
 			hardFilters.Set(strings.TrimPrefix(strings.TrimPrefix(arg, "-"), "Filter="))
 		case arg == "--out" || arg == "-o":
 			if i+1 >= len(args) {
-				return dirs, softFilters, hardFilters, out, help, fmt.Errorf("--out 需要一个路径")
+				return dirs, softFilters, hardFilters, out, help, install, uninstall, fmt.Errorf("--out 需要一个路径")
 			}
 			i++
 			out = args[i]
@@ -257,6 +265,11 @@ func parseCommandLine() (rawStringList, multiValue, multiValue, string, bool, er
 			leftover = append(leftover, arg)
 		}
 	}
+
+	if install && uninstall {
+		return dirs, softFilters, hardFilters, out, help, install, uninstall, fmt.Errorf("--install 与 --uninstall 不能同时使用")
+	}
+
 	for _, arg := range leftover {
 		if strings.HasPrefix(arg, "!") || strings.ContainsAny(arg, "*?[]") {
 			softFilters.Set(arg)
@@ -264,7 +277,7 @@ func parseCommandLine() (rawStringList, multiValue, multiValue, string, bool, er
 		}
 		dirs.Set(arg)
 	}
-	return dirs, softFilters, hardFilters, out, help, nil
+	return dirs, softFilters, hardFilters, out, help, install, uninstall, nil
 }
 
 func normalizeFilters(filters []string) []string {
@@ -459,11 +472,13 @@ func main() {
 		fmt.Fprintf(flag.CommandLine.Output(), "  Pattern 语法: ? 单字符 (test?.log); * 任意串 (*.go); [] 字符范围 (file[0-9].txt); 前缀 ! 取反 (!important.txt)\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  --out/-o      指定输出文件路径或输出目录\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  --no-fold     在目录树中不折叠长文件列表，始终显示全部文件 (默认超过 %d 个文件折叠)\n", maxDisplayFiles)
+		fmt.Fprintf(flag.CommandLine.Output(), "  --install     安装程序到系统 (Linux: /usr/local/bin; Windows: Program Files 并添加 PATH)\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "  --uninstall   从系统中卸载程序\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  位置参数      未被 --dir 消耗的参数：若含 * ? [] 或以 ! 开头视为软过滤，其它视为目录\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  --help/-h     显示此帮助\n")
 	}
 
-	parsedDirs, parsedSoftFilters, parsedHardFilters, outFlag, help, err := parseCommandLine()
+	parsedDirs, parsedSoftFilters, parsedHardFilters, outFlag, help, install, uninstall, err := parseCommandLine()
 	if help {
 		flag.Usage()
 		return
@@ -472,6 +487,22 @@ func main() {
 		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
 		flag.Usage()
 		os.Exit(1)
+	}
+
+	if install {
+		if err := manageInstallation(true); err != nil {
+			fmt.Fprintf(os.Stderr, "安装失败: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if uninstall {
+		if err := manageInstallation(false); err != nil {
+			fmt.Fprintf(os.Stderr, "卸载失败: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	dirs := []string(parsedDirs)
@@ -609,6 +640,130 @@ func processDirs(dirs []string, softFilters []string, hardFilters []string, writ
 		}
 	}
 	return firstErr
+}
+
+func manageInstallation(isInstall bool) error {
+	if runtime.GOOS == "windows" {
+		return manageWindows(isInstall)
+	}
+	return manageUnix(isInstall)
+}
+
+func manageUnix(isInstall bool) error {
+	targetDir := "/usr/local/bin"
+	targetName := "dir2txt"
+	targetPath := filepath.Join(targetDir, targetName)
+
+	if !isInstall {
+		fmt.Printf("正在卸载: %s\n", targetPath)
+		if err := os.Remove(targetPath); err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Errorf("未找到已安装的程序")
+			}
+			return fmt.Errorf("卸载失败 (权限不足?): %v", err)
+		}
+		fmt.Println("[SUCCESS] 卸载成功")
+		return nil
+	}
+
+	exePath, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	realPath, err := filepath.EvalSymlinks(exePath)
+	if err != nil {
+		realPath = exePath
+	}
+
+	fmt.Printf("正在安装: %s -> %s\n", realPath, targetPath)
+
+	srcFile, err := os.Open(realPath)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.OpenFile(targetPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o755)
+	if err != nil {
+		return fmt.Errorf("无法写入目标路径 (请尝试 sudo): %v", err)
+	}
+	defer dstFile.Close()
+
+	if _, err := io.Copy(dstFile, srcFile); err != nil {
+		return err
+	}
+
+	fmt.Println("[SUCCESS] 安装成功！现在可以在任意位置运行 dir2txt")
+	return nil
+}
+
+func manageWindows(isInstall bool) error {
+	programFiles := os.Getenv("ProgramFiles")
+	if programFiles == "" {
+		programFiles = `C:\\Program Files`
+	}
+	installDir := filepath.Join(programFiles, "dir2txt")
+	targetExe := filepath.Join(installDir, "dir2txt.exe")
+
+	if !isInstall {
+		fmt.Printf("正在移除文件: %s\n", targetExe)
+		os.Remove(targetExe)
+		os.Remove(installDir)
+		fmt.Println("[SUCCESS] 文件已移除。")
+		fmt.Println("[WARNING]  注意: 为了安全起见，程序不会自动修改注册表。请手动从环境变量 PATH 中删除该路径。")
+		return nil
+	}
+
+	fmt.Printf("正在安装到: %s\n", installDir)
+	if err := os.MkdirAll(installDir, 0o755); err != nil {
+		return fmt.Errorf("无法创建目录 (请以管理员身份运行): %v", err)
+	}
+
+	exePath, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	srcFile, err := os.Open(exePath)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.OpenFile(targetExe, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o755)
+	if err != nil {
+		return fmt.Errorf("无法写入文件 (请以管理员身份运行): %v", err)
+	}
+	defer dstFile.Close()
+
+	if _, err := io.Copy(dstFile, srcFile); err != nil {
+		return err
+	}
+	fmt.Println("[SUCCESS] 文件复制成功。")
+
+	fmt.Println("正在配置环境变量...")
+
+	psScript := fmt.Sprintf(`
+		$target = "%s"
+		$currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
+		if ($currentPath -like "*$target*") {
+			Write-Host "环境变量已存在，跳过。"
+		} else {
+			$newPath = $currentPath + ";$target"
+			[Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+			Write-Host "环境变量已更新。"
+		}
+	`, installDir)
+
+	cmd := exec.Command("powershell", "-Command", psScript)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Printf("[WARNING] 环境变量自动设置失败: %v\n详情: %s\n请手动将 %s 添加到 PATH\n", err, string(output), installDir)
+	} else {
+		fmt.Print(string(output))
+		fmt.Println("安装完成！请重启终端以生效。")
+	}
+
+	return nil
 }
 
 // processFile 读取文件并格式化写入 Markdown
